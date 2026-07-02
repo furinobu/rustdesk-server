@@ -1,0 +1,130 @@
+name: build 64bitdocker
+
+# ------------- NOTE
+# please setup some secrets before running this workflow:
+# DOCKER_IMAGE_CLASSIC should be the target image name on docker hub for the classic build (e.g. "rustdesk/rustdesk-server")
+# DOCKER_HUB_USERNAME is the username you normally use to login at https://hub.docker.com/
+# DOCKER_HUB_PASSWORD is a token you should create under "account settings / security" with read/write access
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  LATEST_TAG: latest
+  GHCR_USERNAME: furinobu
+  GHCR_IMAGE_CLASSIC: ghcr.io/furinobu/rustdesk-server
+
+jobs:
+  build:
+    name: Build - ${{ matrix.job.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64",   target: "x86_64-unknown-linux-musl" }
+          - { name: "arm64v8", target: "aarch64-unknown-linux-musl" }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: ${{ matrix.job.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+      - name: Build
+        run: cross build --release --all-features --target=${{ matrix.job.target }}
+
+      - name: Exec chmod
+        run: chmod -v a+x target/${{ matrix.job.target }}/release/*
+
+      - name: Publish Artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: |
+            target/${{ matrix.job.target }}/release/hbbr
+            target/${{ matrix.job.target }}/release/hbbs
+            target/${{ matrix.job.target }}/release/rustdesk-utils
+          if-no-files-found: error
+
+  docker-classic:
+    name: Docker push - ${{ matrix.job.name }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { name: "amd64",   docker_platform: "linux/amd64" }
+          - { name: "arm64v8", docker_platform: "linux/arm64" }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-linux-${{ matrix.job.name }}
+          path: docker-classic/
+
+      - name: Make binaries executable
+        run: chmod -v a+x docker-classic/*
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ env.GHCR_USERNAME }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE_CLASSIC }}
+
+      - name: Get git tag
+        run: |
+          T=${GITHUB_REF#refs/*/}
+          M=${T%%.*}
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+          echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: "./docker-classic"
+          platforms: ${{ matrix.job.docker_platform }}
+          push: true
+          provenance: false
+          tags: |
+            ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
+          labels: ${{ steps.meta.outputs.labels }}
